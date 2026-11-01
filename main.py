@@ -14,6 +14,10 @@ from typing import Dict, List
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Constants (configurable via CLI or config file later)
+# Only the config file default below is ever used. The SMTP and sender
+# defaults further down are dead: validate_config requires those keys
+# in the file, so a config that omits them fails instead of falling
+# back to the values named here.
 DEFAULT_CONFIG_FILE = "permission_review_config.json"
 DEFAULT_SMTP_SERVER = "localhost"  # Replace with your SMTP server
 DEFAULT_SMTP_PORT = 25  # Replace with your SMTP port
@@ -265,6 +269,10 @@ def schedule_reviews(config: Dict) -> int:
         accepted form is logged as an error and schedules nothing.
     """
     scheduled = 0
+    # The loops form the full cross product: every reviewer is emailed
+    # about every permission. The config schema has no way to assign a
+    # permission to a specific reviewer, so adding a reviewer adds a
+    # copy of every reminder, not just the ones they own.
     for permission in config["permissions_to_review"]:
         for reviewer in config["reviewers"]:
             schedule_string = permission["review_schedule"]
@@ -346,6 +354,11 @@ def main():
 
             while True:
                 schedule.run_pending()
+                # The parser above accepts "every N seconds", but this
+                # loop only wakes once a minute, so a sub minute
+                # schedule can never fire more often than the poll, and
+                # it fires late by up to a minute. The accepted grammar
+                # promises a precision the loop does not deliver.
                 time.sleep(60)  # Check every minute
     except FileNotFoundError:
         print(f"Error: Configuration file not found: {args.config}")  # Console output for critical error
