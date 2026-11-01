@@ -6,6 +6,7 @@ import datetime
 import smtplib
 from email.mime.text import MIMEText
 import os
+import re
 import json
 from typing import Dict, List
 
@@ -117,8 +118,19 @@ def validate_config(config: Dict) -> None:
     if not isinstance(config["sender_email"], str) or "@" not in config["sender_email"]:
         raise ValueError("Sender email must be a valid email address.")
 
+    # Optional mail transport and review form settings.
+    if "smtp_use_tls" in config and not isinstance(config["smtp_use_tls"], bool):
+        raise ValueError("smtp_use_tls must be a boolean.")
+    for key in ("smtp_username", "smtp_password"):
+        if key in config and not isinstance(config[key], str):
+            raise ValueError(f"{key} must be a string.")
+    if "smtp_username" in config and "smtp_password" not in config:
+        raise ValueError("smtp_password is required when smtp_username is set.")
+    if "review_form_url" in config and not isinstance(config["review_form_url"], str):
+        raise ValueError("review_form_url must be a string.")
 
-def send_email(subject: str, body: str, recipient: str, smtp_server: str, smtp_port: int, sender_email: str) -> None:
+
+def send_email(subject: str, body: str, recipient: str, smtp_server: str, smtp_port: int, sender_email: str, use_tls: bool = False, username: str = None, password: str = None) -> None:
     """
     Sends an email using the specified SMTP settings.
 
@@ -140,6 +152,10 @@ def send_email(subject: str, body: str, recipient: str, smtp_server: str, smtp_p
         msg["To"] = recipient
 
         with smtplib.SMTP(smtp_server, smtp_port) as server:
+            if use_tls:
+                server.starttls()
+            if username:
+                server.login(username, password or "")
             server.sendmail(sender_email, recipient, msg.as_string())
         logging.info(f"Email sent successfully to {recipient}")
     except smtplib.SMTPException as e:
@@ -147,7 +163,7 @@ def send_email(subject: str, body: str, recipient: str, smtp_server: str, smtp_p
         raise
 
 
-def create_review_task(permission: Dict, reviewer: Dict, smtp_server: str, smtp_port: int, sender_email: str) -> None:
+def create_review_task(permission: Dict, reviewer: Dict, smtp_server: str, smtp_port: int, sender_email: str, use_tls: bool = False, username: str = None, password: str = None, review_form_url: str = None) -> None:
     """
     Creates a review task and sends an email to the reviewer.
 
@@ -159,6 +175,10 @@ def create_review_task(permission: Dict, reviewer: Dict, smtp_server: str, smtp_
         sender_email: The sender's email address.
     """
     subject = f"Permission Review Required: {permission['description']}"
+    if review_form_url:
+        form_line = f"Review form: {review_form_url}"
+    else:
+        form_line = "Please use your organization's own review process to record this review."
     body = f"""
     Dear {reviewer['name']},
 
@@ -167,61 +187,133 @@ def create_review_task(permission: Dict, reviewer: Dict, smtp_server: str, smtp_
     Description: {permission['description']}
     Details: {permission['permission_details']}
 
-    Please review this permission and ensure it is still appropriate.  
+    Please review this permission and ensure it is still appropriate.
 
-    [Link to review form - Placeholder]
+    {form_line}
 
     Thank you,
     The Permission Review System
     """
 
     try:
-        send_email(subject, body, reviewer["email"], smtp_server, smtp_port, sender_email)
+        send_email(subject, body, reviewer["email"], smtp_server, smtp_port, sender_email, use_tls, username, password)
     except Exception as e:
         logging.error(f"Failed to send email for {permission['description']} review to {reviewer['email']}: {e}")
 
 
-def schedule_reviews(config: Dict) -> None:
+ACCEPTED_SCHEDULE_FORMS = (
+    "'every N seconds/minutes/hours/days/weeks', "
+    "'daily at HH:MM', or 'weekly on <weekday>' optionally followed by 'at HH:MM'"
+)
+_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+_TIME_PATTERN = r"((?:[01][0-9]|2[0-3]):[0-5][0-9])"
+
+
+def parse_and_schedule(schedule_string: str, job) -> None:
+    """
+    Schedules one job from a review_schedule string using a narrow parser.
+
+    The config value is data, never code: only the fixed forms listed in
+    ACCEPTED_SCHEDULE_FORMS are accepted, and anything else raises
+    ValueError. No part of the string is ever evaluated or executed.
+
+    Args:
+        schedule_string: The review_schedule value from the config.
+        job: The callable to schedule.
+
+    Raises:
+        ValueError: If the value matches no accepted form.
+    """
+    text = " ".join(str(schedule_string).strip().lower().split())
+
+    match = re.fullmatch(r"every ([0-9]+) (second|seconds|minute|minutes|hour|hours|day|days|week|weeks)", text)
+    if match:
+        interval = int(match.group(1))
+        if interval <= 0:
+            raise ValueError(f"Invalid review_schedule value: {schedule_string!r}. Interval must be positive. Accepted forms: {ACCEPTED_SCHEDULE_FORMS}")
+        unit = match.group(2)
+        if not unit.endswith("s"):
+            unit += "s"
+        getattr(schedule.every(interval), unit).do(job)
+        return
+
+    match = re.fullmatch(r"(?:daily|every day) at " + _TIME_PATTERN, text)
+    if match:
+        schedule.every().day.at(match.group(1)).do(job)
+        return
+
+    match = re.fullmatch(r"(?:weekly on|every week on) (" + "|".join(_WEEKDAYS) + r")(?: at " + _TIME_PATTERN + r")?", text)
+    if match:
+        builder = getattr(schedule.every(), match.group(1))
+        if match.group(2):
+            builder = builder.at(match.group(2))
+        builder.do(job)
+        return
+
+    raise ValueError(f"Invalid review_schedule value: {schedule_string!r}. Accepted forms: {ACCEPTED_SCHEDULE_FORMS}")
+
+
+def schedule_reviews(config: Dict) -> int:
     """
     Schedules the permission reviews based on the configuration.
 
     Args:
         config: The configuration dictionary.
+
+    Returns:
+        The number of jobs that were scheduled. A value that matches no
+        accepted form is logged as an error and schedules nothing.
     """
+    scheduled = 0
     for permission in config["permissions_to_review"]:
         for reviewer in config["reviewers"]:
             schedule_string = permission["review_schedule"]
 
-            def job():
-                create_review_task(permission, reviewer, config["smtp_server"], config["smtp_port"], config["sender_email"])
+            def job(permission=permission, reviewer=reviewer):
+                create_review_task(
+                    permission, reviewer,
+                    config["smtp_server"], config["smtp_port"], config["sender_email"],
+                    config.get("smtp_use_tls", False),
+                    config.get("smtp_username"), config.get("smtp_password"),
+                    config.get("review_form_url"),
+                )
 
             try:
-                # Use eval() with caution; ensure the review_schedule string is from a trusted source.
-                # Consider using a safer alternative like a library specifically designed for parsing schedule strings.
-                eval(f"schedule.{schedule_string}.do(job)")
+                parse_and_schedule(schedule_string, job)
+                scheduled += 1
                 logging.info(f"Scheduled review for {permission['description']} by {reviewer['name']} with schedule: {schedule_string}")
+            except ValueError as e:
+                logging.error(f"Failed to schedule review for {permission['description']} by {reviewer['name']}: {e}")
             except Exception as e:
                 logging.error(f"Failed to schedule review for {permission['description']} by {reviewer['name']} with schedule: {schedule_string}: {e}")
+    return scheduled
 
 
-def send_test_email(smtp_server: str, smtp_port: int, sender_email: str) -> None:
+def send_test_email(smtp_server: str, smtp_port: int, sender_email: str, use_tls: bool = False, username: str = None, password: str = None) -> bool:
     """
     Sends a test email to ensure email settings are correct.
+
+    The test message is sent to the sender address.
 
     Args:
         smtp_server: The SMTP server hostname.
         smtp_port: The SMTP server port.
         sender_email: The sender's email address.
+
+    Returns:
+        True when the test email was sent, False when it failed.
     """
     test_recipient = sender_email  # Send to sender to verify.  Ideally this would be configurable via CLI args.
     subject = "Test Email from Permission Review Tool"
     body = "This is a test email to verify that the email settings are configured correctly."
     try:
-        send_email(subject, body, test_recipient, smtp_server, smtp_port, sender_email)
+        send_email(subject, body, test_recipient, smtp_server, smtp_port, sender_email, use_tls, username, password)
         print("Test email sent successfully. Check your inbox.")  # Added console output for user feedback
+        return True
     except Exception as e:
         print(f"Failed to send test email: {e}")  # Added console output for user feedback
         logging.error(f"Failed to send test email: {e}")
+        return False
 
 
 def main():
@@ -236,9 +328,21 @@ def main():
         validate_config(config)
 
         if args.test_email:
-            send_test_email(config["smtp_server"], config["smtp_port"], config["sender_email"])
+            sent = send_test_email(
+                config["smtp_server"], config["smtp_port"], config["sender_email"],
+                config.get("smtp_use_tls", False),
+                config.get("smtp_username"), config.get("smtp_password"),
+            )
+            if not sent:
+                exit(1)
         else:
-            schedule_reviews(config)
+            scheduled = schedule_reviews(config)
+            if scheduled == 0:
+                # Nothing will ever be sent, so the daemon must not sit in
+                # its run loop presenting as healthy.
+                print("Error: No reviews were scheduled. Check that permissions_to_review and reviewers are not empty and that every review_schedule value uses an accepted form.")
+                logging.error("No reviews scheduled; exiting instead of running with zero jobs.")
+                exit(1)
 
             while True:
                 schedule.run_pending()
